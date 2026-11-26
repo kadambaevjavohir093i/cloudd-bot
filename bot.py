@@ -15,8 +15,9 @@ Env vars (Render -> Environment):
   API_ID, API_HASH   - from my.telegram.org
   SESSION            - string printed by login.py (secret = your account)
   BOT_TOKEN          - from @BotFather
-  GROQ_API_KEY  - from console.groq.com, free (optional, enables AI mode)
-  GROQ_MODEL    - optional, default openai/gpt-oss-120b
+  GROQ_API_KEY       - from console.groq.com, free (optional, enables AI mode)
+  GROQ_MODEL         - optional, default openai/gpt-oss-120b
+  STARTUP_DELAY      - optional, seconds to wait before logging in (default 25 on Render, 0 elsewhere)
   PORT               - set automatically by Render
 """
 import asyncio
@@ -25,6 +26,7 @@ import json
 import logging
 import os
 import re
+import signal
 import sys
 import time
 import unicodedata
@@ -32,7 +34,7 @@ import urllib.request
 
 import aiohttp
 from aiohttp import web
-from telethon import Button, TelegramClient, events, functions
+from telethon import Button, TelegramClient, errors, events, functions
 from telethon.sessions import StringSession
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -53,6 +55,8 @@ BOT_TOKEN = env("BOT_TOKEN")
 GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
 GROQ_MODEL = os.environ.get("GROQ_MODEL", "").strip() or "openai/gpt-oss-120b"
 PORT = int(os.environ.get("PORT", "10000"))
+# Render sets RENDER=true. See main() for why we wait there.
+STARTUP_DELAY = int(os.environ.get("STARTUP_DELAY", "").strip() or (25 if os.environ.get("RENDER") else 0))
 
 HELP = (
     "Two ways to send a message from your account:\n\n"
@@ -132,6 +136,22 @@ def rank(query, people):
     return [], [u for s, u in scored if s >= 0.42][:5]
 
 
+def preview(recipient, text, note=None):
+    body = f"To: {label(recipient)}\n\n{text}"
+    return f"{body}\n\n⚠️ {note}" if note else body
+
+
+def send_error_text(exc):
+    """Short human explanation of why Telegram refused to send."""
+    if isinstance(exc, errors.FloodWaitError):
+        return f"Telegram asks to wait {exc.seconds} s before sending more."
+    if isinstance(exc, errors.PeerFloodError):
+        return "Telegram has limited your account from messaging people who are not your contacts. Check @SpamBot."
+    if isinstance(exc, errors.YouBlockedUserError):
+        return "You have blocked this person. Unblock them first."
+    return str(exc) or type(exc).__name__
+
+
 # ---------- AI ----------
 
 def delete_old_webhook():
@@ -144,8 +164,8 @@ def delete_old_webhook():
 
 
 def looks_like_exact(raw):
-    """'Malika: hi' or '@user: hi' -> exact mode. Longer text before ':' -> AI mode."""
-    if ":" not in raw:
+    """'Malika: hi' or '@user: hi' -> exact mode. Longer text before ':' or a link -> AI mode."""
+    if ":" not in raw or re.match(r"\w+://", raw):
         return False
     who = raw.split(":", 1)[0].strip()
     return bool(who) and (who.startswith("@") or len(who.split()) <= 2)
@@ -186,29 +206,59 @@ async def ai_compose(owner_name, instruction, previous=None):
             },
             timeout=aiohttp.ClientTimeout(total=60),
         ) as resp:
-            data = await resp.json(content_type=None)
+            try:
+                data = await resp.json(content_type=None)
+            except ValueError:  # e.g. an HTML error page
+                raise RuntimeError(f"AI error: HTTP {resp.status}") from None
             if resp.status != 200:
-                err = (data.get("error") or {}).get("message", str(resp.status))
-                raise RuntimeError(f"AI error: {err}")
+                err = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
+                raise RuntimeError(f"AI error: {err or resp.status}")
 
     text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
     match = re.search(r"\{.*\}", text, re.S)
-    if not match:
+    try:
+        result = json.loads(match.group(0)) if match else None
+    except ValueError:
+        result = None
+    if not isinstance(result, dict):
         raise RuntimeError("AI returned an unexpected answer")
-    result = json.loads(match.group(0))
     return result.get("recipient"), (result.get("message") or "").strip()
 
 
 # ---------- bot ----------
 
+async def start_health_page():
+    """Tiny web page so Render sees the service as healthy (and UptimeRobot keeps it awake)."""
+    async def health(_request):
+        return web.Response(text="cloudd-bot is running")
+
+    app = web.Application()
+    app.router.add_get("/", health)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    await web.TCPSite(runner, "0.0.0.0", PORT).start()
+    log.info("Health page on port %s", PORT)
+    return runner
+
+
 async def main():
+    # On deploy Render starts the new instance and stops the old one only after the new one
+    # answers on its port. If both were logged in at once, Telegram could see the same SESSION
+    # from two servers and revoke it (AuthKeyDuplicatedError) - then login.py has to be run again.
+    # So: open the port first, give the old instance time to stop, and only then log in.
+    runner = await start_health_page()
+    if STARTUP_DELAY:
+        log.info("Waiting %s s for the previous instance to stop", STARTUP_DELAY)
+        await asyncio.sleep(STARTUP_DELAY)
+
     delete_old_webhook()
 
     try:
         session = StringSession(SESSION)
     except ValueError:
         sys.exit("SESSION is not a valid session string. Copy the whole string from login.py again.")
-    user = TelegramClient(session, API_ID, API_HASH)
+    # The account only sends messages, it doesn't need a stream of updates from all your chats.
+    user = TelegramClient(session, API_ID, API_HASH, receive_updates=False)
     bot = TelegramClient(StringSession(), API_ID, API_HASH)
 
     await user.connect()
@@ -223,7 +273,9 @@ async def main():
     await bot.start(bot_token=BOT_TOKEN)
     log.info("Bot started")
 
-    pending = {}   # preview message id -> {"to": user, "text": str, "instruction": str|None}
+    # preview message id -> {"to": user, "text": str, "instruction": str|None, "busy": bool}
+    # "busy" is set while sending or writing another version, so a second tap can't send twice.
+    pending = {}
     choosing = {}  # "which one?" message id -> {"candidates": [...], "text": str, "instruction": str|None}
     people_cache = {"at": 0.0, "list": []}
 
@@ -232,6 +284,15 @@ async def main():
         if with_retry:
             rows.append([Button.inline("🔄 Another version", b"retry")])
         return rows
+
+    def new_pending(recipient, text, instruction):
+        return {"to": recipient, "text": text, "instruction": instruction, "busy": False}
+
+    async def edit_preview(event, text, buttons):
+        try:
+            await event.edit(text, buttons=buttons, parse_mode=None)
+        except errors.MessageNotModifiedError:
+            pass  # same text as already shown (e.g. the same error twice)
 
     async def load_people():
         """Saved contacts + people from recent chats (cached for 5 minutes)."""
@@ -264,9 +325,9 @@ async def main():
                 return [], []
         return rank(query, await load_people())
 
-    async def propose(event, who, text, instruction):
+    async def propose(event, who, text, instruction, found=None):
         """Find the person and show a preview (or ask which person is meant)."""
-        matches, suggestions = await find_people(who)
+        matches, suggestions = found if found is not None else await find_people(who)
         if not matches:
             msg = f"No one found for “{who}”."
             if suggestions:
@@ -277,10 +338,10 @@ async def main():
             await event.reply(msg, parse_mode=None)
             return
         if len(matches) == 1:
-            preview = await event.reply(
-                f"To: {label(matches[0])}\n\n{text}", buttons=send_buttons(bool(instruction)), parse_mode=None
+            shown = await event.reply(
+                preview(matches[0], text), buttons=send_buttons(bool(instruction)), parse_mode=None
             )
-            pending[preview.id] = {"to": matches[0], "text": text, "instruction": instruction}
+            pending[shown.id] = new_pending(matches[0], text, instruction)
             return
         rows = [[Button.inline(label(u)[:40], f"pick:{i}".encode())] for i, u in enumerate(matches)]
         rows.append([Button.inline("❌ Cancel", b"cancel")])
@@ -325,8 +386,12 @@ async def main():
             if not text:
                 await event.reply("Need a message after the name.  Example:  Malika: hi", parse_mode=None)
                 return
-            await propose(event, who, text, None)
-            return
+            found = await find_people(who)
+            if found[0] or not GROQ_API_KEY or who.startswith("@"):
+                await propose(event, who, text, None, found)
+                return
+            # "напиши Малике: привет" looks like "Name: text", but nobody is called
+            # "напиши Малике" - so it is a request; let the AI read it below.
 
         # AI mode
         if not GROQ_API_KEY:
@@ -354,60 +419,89 @@ async def main():
             await event.answer("Not allowed")
             return
         data = event.data or b""
+        mid = event.message_id
 
         # "which person?" step
-        if event.message_id in choosing:
-            item = choosing.pop(event.message_id)
+        if mid in choosing:
+            item = choosing.pop(mid)
             if not data.startswith(b"pick:"):
                 await event.edit("❌ Cancelled")
                 return
             recipient = item["candidates"][int(data[5:])]
+            pending[mid] = new_pending(recipient, item["text"], item["instruction"])
             await event.edit(
-                f"To: {label(recipient)}\n\n{item['text']}",
-                buttons=send_buttons(bool(item["instruction"])),
-                parse_mode=None,
+                preview(recipient, item["text"]), buttons=send_buttons(bool(item["instruction"])), parse_mode=None
             )
-            pending[event.message_id] = {"to": recipient, "text": item["text"], "instruction": item["instruction"]}
             return
 
-        item = pending.get(event.message_id)
+        item = pending.get(mid)
         if not item:
             await event.answer("This preview expired. Send it again.")
             return
-        recipient, text = item["to"], item["text"]
+        if item["busy"]:
+            await event.answer("Wait a second…")
+            return
+        recipient = item["to"]
+        with_retry = bool(item["instruction"])
 
-        if data == b"retry" and item["instruction"]:
-            await event.answer("Writing another version…")
+        if data == b"retry" and with_retry:
+            item["busy"] = True  # before any await, so a quick second tap is refused
+            note = None
             try:
-                _, new_text = await ai_compose(owner_name, item["instruction"], previous=text)
+                await event.answer("Writing another version…")
+                _, new_text = await ai_compose(owner_name, item["instruction"], previous=item["text"])
+                if new_text:
+                    item["text"] = new_text
+                else:
+                    note = "Couldn't write another version, try again."
             except Exception as exc:
-                await event.answer(f"Failed: {exc}"[:190], alert=True)
-                return
-            if new_text:
-                item["text"] = new_text
-                await event.edit(f"To: {label(recipient)}\n\n{new_text}", buttons=send_buttons(True), parse_mode=None)
+                log.warning("AI retry failed: %s", exc)
+                note = f"Couldn't write another version: {exc}"
+            finally:
+                item["busy"] = False
+            await edit_preview(event, preview(recipient, item["text"], note), send_buttons(True))
             return
 
-        pending.pop(event.message_id, None)
         if data == b"send":
-            await user.send_message(recipient, text, parse_mode=None)
-            await event.edit(f"✅ Sent to {label(recipient)}\n\n{text}", parse_mode=None)
-            log.info("Message sent to a contact")
-        else:
-            await event.edit("❌ Cancelled")
+            item["busy"] = True  # before any await, so a double tap can't send twice
+            try:
+                await event.answer("Sending…")
+                await user.send_message(recipient, item["text"], parse_mode=None)
+            except Exception as exc:
+                log.warning("Send failed: %s", type(exc).__name__)
+                note = f"Not sent: {send_error_text(exc)}"
+            else:
+                pending.pop(mid, None)
+                await event.edit(f"✅ Sent to {label(recipient)}\n\n{item['text']}", parse_mode=None)
+                log.info("Message sent to a contact")
+                return
+            finally:
+                item["busy"] = False
+            # keep the preview and its buttons, so you can tap Send again later
+            await edit_preview(event, preview(recipient, item["text"], note), send_buttons(with_retry))
+            return
 
-    # Tiny web page so Render sees the service as healthy (and pingers can keep it awake).
-    async def health(_request):
-        return web.Response(text="cloudd-bot is running")
+        pending.pop(mid, None)
+        await event.edit("❌ Cancelled")
 
-    app = web.Application()
-    app.router.add_get("/", health)
-    runner = web.AppRunner(app)
-    await runner.setup()
-    await web.TCPSite(runner, "0.0.0.0", PORT).start()
-    log.info("Health page on port %s", PORT)
+    # Run until Render stops us (SIGTERM) or a client drops for good, then close the Telegram
+    # connections cleanly so the next instance starts on a free SESSION.
+    stop = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGTERM, signal.SIGINT):
+        loop.add_signal_handler(sig, stop.set)
+    stopping = asyncio.ensure_future(stop.wait())
+    clients = [asyncio.ensure_future(c.run_until_disconnected()) for c in (user, bot)]
+    await asyncio.wait([stopping, *clients], return_when=asyncio.FIRST_COMPLETED)
 
-    await asyncio.gather(user.run_until_disconnected(), bot.run_until_disconnected())
+    log.info("Shutting down")
+    stopping.cancel()
+    await asyncio.gather(user.disconnect(), bot.disconnect(), return_exceptions=True)
+    results = await asyncio.gather(*clients, return_exceptions=True)
+    await runner.cleanup()
+    for result in results:
+        if isinstance(result, Exception):
+            raise result  # non-zero exit, Render restarts the service
 
 
 if __name__ == "__main__":
