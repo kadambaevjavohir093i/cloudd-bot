@@ -5,15 +5,15 @@ Two ways to use it:
   1) Exact text:   Malika: are you free for dinner tomorrow at 7pm?
      -> sends exactly that text.
   2) AI mode:      ask Malika if she's free for dinner tomorrow at 7, make it sweet
-     -> Claude writes the message for you.
+     -> AI writes the message for you.
 Either way you get a preview first; nothing is sent until you tap ✅ Send.
 
 Env vars (Render -> Environment):
   API_ID, API_HASH   - from my.telegram.org
   SESSION            - string printed by login.py (secret = your account)
   BOT_TOKEN          - from @BotFather
-  ANTHROPIC_API_KEY  - from console.anthropic.com (optional, enables AI mode)
-  ANTHROPIC_MODEL    - optional, default claude-haiku-5-5
+  GROQ_API_KEY  - from console.groq.com, free (optional, enables AI mode)
+  GROQ_MODEL    - optional, default openai/gpt-oss-120b
   PORT               - set automatically by Render
 """
 import asyncio
@@ -44,8 +44,8 @@ API_ID = int(env("API_ID"))
 API_HASH = env("API_HASH")
 SESSION = env("SESSION")
 BOT_TOKEN = env("BOT_TOKEN")
-ANTHROPIC_API_KEY = os.environ.get("ANTHROPIC_API_KEY", "").strip()
-ANTHROPIC_MODEL = os.environ.get("ANTHROPIC_MODEL", "").strip() or "claude-haiku-5-5"
+GROQ_API_KEY = os.environ.get("GROQ_API_KEY", "").strip()
+GROQ_MODEL = os.environ.get("GROQ_MODEL", "").strip() or "openai/gpt-oss-120b"
 PORT = int(os.environ.get("PORT", "10000"))
 
 HELP = (
@@ -82,7 +82,7 @@ def looks_like_exact(raw):
 
 
 async def ai_compose(owner_name, instruction, previous=None):
-    """Ask Claude for {"recipient": ..., "message": ...}."""
+    """Ask the AI for {"recipient": ..., "message": ...}."""
     system = (
         f"You write Telegram messages that {owner_name} will send from their own account to their contacts. "
         "From the instruction, find the recipient exactly as the user named them (a name or @username, "
@@ -101,26 +101,27 @@ async def ai_compose(owner_name, instruction, previous=None):
 
     async with aiohttp.ClientSession() as http:
         async with http.post(
-            "https://api.anthropic.com/v1/messages",
+            "https://api.groq.com/openai/v1/chat/completions",
             headers={
-                "x-api-key": ANTHROPIC_API_KEY,
-                "anthropic-version": "2023-06-01",
+                "Authorization": f"Bearer {GROQ_API_KEY}",
                 "content-type": "application/json",
             },
             json={
-                "model": ANTHROPIC_MODEL,
-                "max_tokens": 500,
-                "system": system,
-                "messages": [{"role": "user", "content": content}],
+                "model": GROQ_MODEL,
+                "max_completion_tokens": 1500,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": content},
+                ],
             },
             timeout=aiohttp.ClientTimeout(total=60),
         ) as resp:
-            data = await resp.json()
+            data = await resp.json(content_type=None)
             if resp.status != 200:
                 err = (data.get("error") or {}).get("message", str(resp.status))
                 raise RuntimeError(f"AI error: {err}")
 
-    text = "".join(block.get("text", "") for block in data.get("content", []))
+    text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
     match = re.search(r"\{.*\}", text, re.S)
     if not match:
         raise RuntimeError("AI returned an unexpected answer")
@@ -145,7 +146,7 @@ async def main():
     owner_id = me.id
     owner_name = full_name(me)
     log.info("Userbot logged in as %s", owner_name)
-    log.info("AI mode: %s", f"on ({ANTHROPIC_MODEL})" if ANTHROPIC_API_KEY else "off (no ANTHROPIC_API_KEY)")
+    log.info("AI mode: %s", f"on ({GROQ_MODEL})" if GROQ_API_KEY else "off (no GROQ_API_KEY)")
 
     await bot.start(bot_token=BOT_TOKEN)
     log.info("Bot started")
@@ -217,8 +218,8 @@ async def main():
             return
 
         # AI mode
-        if not ANTHROPIC_API_KEY:
-            await event.reply("AI mode is off (no ANTHROPIC_API_KEY in Render).\nUse:  Name: message")
+        if not GROQ_API_KEY:
+            await event.reply("AI mode is off (no GROQ_API_KEY in Render).\nUse:  Name: message")
             return
         thinking = await event.reply("✍️ Writing…")
         try:
