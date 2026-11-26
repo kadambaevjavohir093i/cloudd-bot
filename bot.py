@@ -5,7 +5,9 @@ from telegram.ext import Application, CommandHandler, MessageHandler, ContextTyp
 
 logging.basicConfig(level=logging.INFO)
 
-TOKEN = os.environ["BOT_TOKEN"]
+TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+if not TOKEN:
+    raise SystemExit("BOT_TOKEN is not set. Add it in Render -> Environment.")
 URL = os.environ.get("RENDER_EXTERNAL_URL")  # set automatically by Render
 PORT = int(os.environ.get("PORT", 10000))
 
