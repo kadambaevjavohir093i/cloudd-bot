@@ -8,6 +8,9 @@ Two ways to use it:
      -> AI writes the message for you.
 Either way you get a preview first; nothing is sent until you tap ✅ Send.
 
+People are found in your saved contacts AND your recent chats. Spelling does not
+have to be exact: Малика / Malika / malikaga all find the same person.
+
 Env vars (Render -> Environment):
   API_ID, API_HASH   - from my.telegram.org
   SESSION            - string printed by login.py (secret = your account)
@@ -17,11 +20,14 @@ Env vars (Render -> Environment):
   PORT               - set automatically by Render
 """
 import asyncio
+import difflib
 import json
 import logging
 import os
 import re
 import sys
+import time
+import unicodedata
 import urllib.request
 
 import aiohttp
@@ -55,14 +61,78 @@ HELP = (
     "2) AI writes it — just describe what you want\n"
     "   ask Malika if she's free for dinner tomorrow at 7, make it sweet\n"
     "   спроси у Малики, свободна ли она завтра в 7 на ужин\n\n"
-    "You always see a preview first. Nothing is sent until you tap ✅ Send."
+    "You always see a preview first. Nothing is sent until you tap ✅ Send.\n\n"
+    "/who name — check who I find for a name"
 )
+
+# ---------- name matching (works across Cyrillic / Latin spelling) ----------
+
+CYR2LAT = {
+    "а": "a", "б": "b", "в": "v", "г": "g", "д": "d", "е": "e", "ё": "yo", "ж": "j", "з": "z",
+    "и": "i", "й": "y", "к": "k", "л": "l", "м": "m", "н": "n", "о": "o", "п": "p", "р": "r",
+    "с": "s", "т": "t", "у": "u", "ф": "f", "х": "x", "ц": "ts", "ч": "ch", "ш": "sh", "щ": "sh",
+    "ъ": "", "ы": "i", "ь": "", "э": "e", "ю": "yu", "я": "ya",
+    "ў": "o", "қ": "q", "ғ": "g", "ҳ": "h",
+}
+APOSTROPHES = "'`ʻʼ’‘"
+
+
+def norm(text):
+    """Lowercase, transliterate Cyrillic to Latin, drop emoji/punctuation, unify spelling variants."""
+    text = unicodedata.normalize("NFKC", text or "").lower()
+    text = "".join(ch for ch in text if ch not in APOSTROPHES)
+    text = "".join(CYR2LAT.get(ch, ch) for ch in text)
+    text = "".join(ch if ch.isalnum() else " " for ch in text)
+    for a, b in (("kh", "x"), ("zh", "j"), ("h", "x"), ("w", "v"), ("q", "k"), ("yo", "o"), ("ye", "e"), ("iy", "i")):
+        text = text.replace(a, b)
+    return " ".join(text.split())
+
+
+def score(q, name):
+    """How well normalized query q matches normalized name (0..1)."""
+    if not q or not name:
+        return 0.0
+    if q == name:
+        return 1.0
+    qt, nt = q.split(), name.split()
+    if all(t in nt for t in qt):
+        return 0.95
+    if all(any(n.startswith(t) for n in nt) for t in qt):
+        return 0.9
+    if q in name:
+        return 0.85
+    best = max(difflib.SequenceMatcher(None, q, x).ratio() for x in nt + [name])
+    return best * 0.84
 
 
 def full_name(u):
     name = f"{u.first_name or ''} {u.last_name or ''}".strip()
     return name or (f"@{u.username}" if u.username else str(u.id))
 
+
+def label(u):
+    name = full_name(u)
+    if u.username and not name.startswith("@"):
+        name += f" (@{u.username})"
+    return name
+
+
+def rank(query, people):
+    """Return (matches, suggestions). matches = confident hits, best first."""
+    q = norm(query)
+    scored = []
+    for u in people:
+        s = max(score(q, norm(full_name(u))), score(q, norm(u.username or "")))
+        scored.append((s, u))
+    scored.sort(key=lambda x: -x[0])
+    good = [(s, u) for s, u in scored if s >= 0.63]
+    if good:
+        top = good[0][0]
+        return [u for s, u in good if s >= top - 0.06][:6], []
+    return [], [u for s, u in scored if s >= 0.42][:5]
+
+
+# ---------- AI ----------
 
 def delete_old_webhook():
     # An older version of this bot set a Bot API webhook; it blocks updates for this version.
@@ -129,6 +199,8 @@ async def ai_compose(owner_name, instruction, previous=None):
     return result.get("recipient"), (result.get("message") or "").strip()
 
 
+# ---------- bot ----------
+
 async def main():
     delete_old_webhook()
 
@@ -151,50 +223,93 @@ async def main():
     await bot.start(bot_token=BOT_TOKEN)
     log.info("Bot started")
 
-    pending = {}  # preview message id -> {"to": user, "text": str, "instruction": str|None}
+    pending = {}   # preview message id -> {"to": user, "text": str, "instruction": str|None}
+    choosing = {}  # "which one?" message id -> {"candidates": [...], "text": str, "instruction": str|None}
+    people_cache = {"at": 0.0, "list": []}
 
-    def buttons(with_retry):
-        row = [Button.inline("✅ Send", b"send"), Button.inline("❌ Cancel", b"cancel")]
-        rows = [row]
+    def send_buttons(with_retry):
+        rows = [[Button.inline("✅ Send", b"send"), Button.inline("❌ Cancel", b"cancel")]]
         if with_retry:
             rows.append([Button.inline("🔄 Another version", b"retry")])
         return rows
 
-    async def find_contacts(query):
+    async def load_people():
+        """Saved contacts + people from recent chats (cached for 5 minutes)."""
+        if people_cache["list"] and time.monotonic() - people_cache["at"] < 300:
+            return people_cache["list"]
+        found = {}
+        try:
+            result = await user(functions.contacts.GetContactsRequest(hash=0))
+            for u in result.users:
+                found[u.id] = u
+        except Exception as exc:
+            log.warning("Could not load contacts: %s", type(exc).__name__)
+        try:
+            async for dialog in user.iter_dialogs(limit=300):
+                if dialog.is_user:
+                    found.setdefault(dialog.entity.id, dialog.entity)
+        except Exception as exc:
+            log.warning("Could not load chats: %s", type(exc).__name__)
+        people = [u for u in found.values() if not getattr(u, "bot", False) and not getattr(u, "deleted", False)]
+        log.info("Loaded %d people (contacts + chats)", len(people))
+        people_cache["list"], people_cache["at"] = people, time.monotonic()
+        return people
+
+    async def find_people(query):
         query = query.strip()
         if query.startswith("@"):
             try:
-                return [await user.get_entity(query)]
+                return [await user.get_entity(query)], []
             except Exception:
-                return []
-        q = query.lower()
-        result = await user(functions.contacts.GetContactsRequest(hash=0))
-        people = [u for u in result.users if not u.bot]
-        exact = [u for u in people if full_name(u).lower() == q]
-        if exact:
-            return exact
-        partial = [u for u in people if q in full_name(u).lower()]
-        if partial:
-            return partial
-        # match on first name only (e.g. "Malika" vs contact "Malika ❤️")
-        return [u for u in people if (u.first_name or "").lower().startswith(q)]
+                return [], []
+        return rank(query, await load_people())
 
-    async def resolve_one(event, who):
-        matches = await find_contacts(who)
+    async def propose(event, who, text, instruction):
+        """Find the person and show a preview (or ask which person is meant)."""
+        matches, suggestions = await find_people(who)
         if not matches:
-            await event.reply(f"No contact found for “{who}”. Use the name as saved in your contacts, or @username.")
-            return None
-        if len(matches) > 1:
-            names = "\n".join(f"• {full_name(u)}" for u in matches[:10])
-            await event.reply(f"Several contacts match “{who}”:\n{names}\n\nUse the full name.")
-            return None
-        return matches[0]
+            msg = f"No one found for “{who}”."
+            if suggestions:
+                msg += "\n\nClosest names:\n" + "\n".join(f"• {label(u)}" for u in suggestions)
+                msg += "\n\nSend it again with the name as shown."
+            else:
+                msg += "\nUse the name as it appears in your Telegram, or @username."
+            await event.reply(msg, parse_mode=None)
+            return
+        if len(matches) == 1:
+            preview = await event.reply(
+                f"To: {label(matches[0])}\n\n{text}", buttons=send_buttons(bool(instruction)), parse_mode=None
+            )
+            pending[preview.id] = {"to": matches[0], "text": text, "instruction": instruction}
+            return
+        rows = [[Button.inline(label(u)[:40], f"pick:{i}".encode())] for i, u in enumerate(matches)]
+        rows.append([Button.inline("❌ Cancel", b"cancel")])
+        ask = await event.reply(f"Which “{who}” do you mean?", buttons=rows, parse_mode=None)
+        choosing[ask.id] = {"candidates": matches, "text": text, "instruction": instruction}
 
     @bot.on(events.NewMessage(pattern=r"^/(start|help)"))
     async def on_start(event):
         if event.sender_id != owner_id:
             return
-        await event.reply(HELP)
+        await event.reply(HELP, parse_mode=None)
+
+    @bot.on(events.NewMessage(pattern=r"^/who(?:\s+(.+))?$"))
+    async def on_who(event):
+        if event.sender_id != owner_id:
+            return
+        query = (event.pattern_match.group(1) or "").strip()
+        if not query:
+            await event.reply("Usage: /who name", parse_mode=None)
+            return
+        people_cache["at"] = 0.0  # force a fresh list
+        matches, suggestions = await find_people(query)
+        if matches:
+            msg = "Found:\n" + "\n".join(f"• {label(u)}" for u in matches)
+        elif suggestions:
+            msg = "No exact match. Closest:\n" + "\n".join(f"• {label(u)}" for u in suggestions)
+        else:
+            msg = f"No one found for “{query}” among {len(people_cache['list'])} people in your contacts and chats."
+        await event.reply(msg, parse_mode=None)
 
     @bot.on(events.NewMessage(func=lambda e: e.is_private and not (e.raw_text or "").startswith("/")))
     async def on_message(event):
@@ -208,25 +323,21 @@ async def main():
             who, text = raw.split(":", 1)
             who, text = who.strip(), text.strip()
             if not text:
-                await event.reply("Need a message after the name.  Example:  Malika: hi")
+                await event.reply("Need a message after the name.  Example:  Malika: hi", parse_mode=None)
                 return
-            recipient = await resolve_one(event, who)
-            if not recipient:
-                return
-            preview = await event.reply(f"To: {full_name(recipient)}\n\n{text}", buttons=buttons(False))
-            pending[preview.id] = {"to": recipient, "text": text, "instruction": None}
+            await propose(event, who, text, None)
             return
 
         # AI mode
         if not GROQ_API_KEY:
-            await event.reply("AI mode is off (no GROQ_API_KEY in Render).\nUse:  Name: message")
+            await event.reply("AI mode is off (no GROQ_API_KEY in Render).\nUse:  Name: message", parse_mode=None)
             return
         thinking = await event.reply("✍️ Writing…")
         try:
             who, text = await ai_compose(owner_name, raw)
         except Exception as exc:
             log.warning("AI compose failed: %s", exc)
-            await thinking.edit(f"Couldn't write it: {exc}\nTry again, or use  Name: message")
+            await thinking.edit(f"Couldn't write it: {exc}\nTry again, or use  Name: message", parse_mode=None)
             return
         if not who:
             await thinking.edit("Who should I send it to? Mention the person's name.")
@@ -235,24 +346,37 @@ async def main():
             await thinking.edit("Couldn't write the message, try rephrasing.")
             return
         await thinking.delete()
-        recipient = await resolve_one(event, who)
-        if not recipient:
-            return
-        preview = await event.reply(f"To: {full_name(recipient)}\n\n{text}", buttons=buttons(True))
-        pending[preview.id] = {"to": recipient, "text": text, "instruction": raw}
+        await propose(event, str(who), text, raw)
 
     @bot.on(events.CallbackQuery)
     async def on_button(event):
         if event.sender_id != owner_id:
             await event.answer("Not allowed")
             return
+        data = event.data or b""
+
+        # "which person?" step
+        if event.message_id in choosing:
+            item = choosing.pop(event.message_id)
+            if not data.startswith(b"pick:"):
+                await event.edit("❌ Cancelled")
+                return
+            recipient = item["candidates"][int(data[5:])]
+            await event.edit(
+                f"To: {label(recipient)}\n\n{item['text']}",
+                buttons=send_buttons(bool(item["instruction"])),
+                parse_mode=None,
+            )
+            pending[event.message_id] = {"to": recipient, "text": item["text"], "instruction": item["instruction"]}
+            return
+
         item = pending.get(event.message_id)
         if not item:
             await event.answer("This preview expired. Send it again.")
             return
         recipient, text = item["to"], item["text"]
 
-        if event.data == b"retry" and item["instruction"]:
+        if data == b"retry" and item["instruction"]:
             await event.answer("Writing another version…")
             try:
                 _, new_text = await ai_compose(owner_name, item["instruction"], previous=text)
@@ -261,13 +385,13 @@ async def main():
                 return
             if new_text:
                 item["text"] = new_text
-                await event.edit(f"To: {full_name(recipient)}\n\n{new_text}", buttons=buttons(True))
+                await event.edit(f"To: {label(recipient)}\n\n{new_text}", buttons=send_buttons(True), parse_mode=None)
             return
 
         pending.pop(event.message_id, None)
-        if event.data == b"send":
-            await user.send_message(recipient, text)
-            await event.edit(f"✅ Sent to {full_name(recipient)}\n\n{text}")
+        if data == b"send":
+            await user.send_message(recipient, text, parse_mode=None)
+            await event.edit(f"✅ Sent to {label(recipient)}\n\n{text}", parse_mode=None)
             log.info("Message sent to a contact")
         else:
             await event.edit("❌ Cancelled")
