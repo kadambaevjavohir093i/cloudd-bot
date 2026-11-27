@@ -523,16 +523,22 @@ async def main():
         if not text:
             await thinking.edit("Couldn't write the message, try rephrasing.")
             return
+        who = str(who).strip()
+        if not who.startswith("@") and f"@{who}".lower() in raw.lower():
+            who = "@" + who  # you wrote @username: look up exactly that account, not a fuzzy name
         if at is None and send_at:  # "at 5pm tell Malika I'm late"
             at = parse_send_at(send_at)
-            if at is None or at <= local_now():
+            now = local_now()
+            if at and at <= now and now - at < timedelta(days=1):
+                at += timedelta(days=1)  # "at 10am" when it is already 14:00 -> tomorrow 10:00
+            if at is None or at <= now:
                 await thinking.edit(
                     "I couldn't work out a future time to send it. Start with the time, e.g.  17:00 Malika: hi",
                     parse_mode=None,
                 )
                 return
         await thinking.delete()
-        await propose(event, str(who), text, raw, at=at)
+        await propose(event, who, text, raw, at=at)
 
     @bot.on(events.CallbackQuery)
     async def on_button(event):
