@@ -84,6 +84,7 @@ HELP = (
     "   tomorrow 9:00 Aziz: happy birthday!\n"
     "   or just say it: at 5pm tell Malika I'm running late\n"
     f"Times are {ZONE_NAME} time, whatever your phone's clock says.\n"
+    "Several at once: one per line, each starting with its time or name.\n"
     "Telegram sends it by itself at that time, even if this bot is offline.\n\n"
     "You always see a preview first. Nothing is sent or scheduled until you tap the button.\n\n"
     "/who name — check who I find for a name"
@@ -277,6 +278,8 @@ async def ai_compose(owner_name, instruction, previous=None):
         "'в 17:00 напиши Малике', 'soat 5 da Malikaga yoz'), put that moment in send_at as "
         "'YYYY-MM-DD HH:MM' in the user's time. A time that is only part of what the message says "
         "(e.g. 'ask if she is free at 7') is NOT send_at. If it should go now, send_at is null. "
+        "If the instruction asks to send messages to MORE THAN ONE person, set recipient to \"MULTIPLE\" "
+        "(mentioning another person inside one message, like 'ask Malika if Aziz is coming', is still one). "
         "Reply with ONLY a JSON object with exactly these keys: "
         '{"recipient": "...", "message": "...", "send_at": null} '
         '- send_at is null or a string like "2026-11-28 17:00"; recipient is null if no recipient is clear.'
@@ -532,7 +535,18 @@ async def main():
         raw = (event.raw_text or "").strip()
         if not raw:
             return
+        # Several lines that each look like a request ("20:26 ask @a ..." / "Malika: hi") are
+        # handled one by one, each with its own preview. Anything else is one message, so
+        # "Malika: line one<newline>line two" still sends both lines to Malika.
+        lines = [line.strip() for line in raw.splitlines() if line.strip()]
+        now = local_now()
+        if len(lines) > 1 and all(split_time(line, now)[0] or looks_like_exact(line) for line in lines):
+            for line in lines:
+                await handle_request(event, line)
+            return
+        await handle_request(event, raw)
 
+    async def handle_request(event, raw):
         # "17:00 Malika: hi" / "5pm ask Malika ..." -> send at that time
         at, raw = split_time(raw, local_now())
         if at and at <= local_now():
@@ -568,6 +582,13 @@ async def main():
             return
         if not who:
             await thinking.edit("Who should I send it to? Mention the person's name.")
+            return
+        if str(who).strip().upper() == "MULTIPLE":
+            await thinking.edit(
+                "That's for several people. Send each one as a separate message, or put each on its own line "
+                "starting with the time or the name:\n20:26 ask @user1 …\n20:27 напиши @user2 …",
+                parse_mode=None,
+            )
             return
         if not text:
             await thinking.edit("Couldn't write the message, try rephrasing.")
