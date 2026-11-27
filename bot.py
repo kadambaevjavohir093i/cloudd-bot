@@ -8,6 +8,10 @@ Two ways to use it:
      -> AI writes the message for you.
 Either way you get a preview first; nothing is sent until you tap ✅ Send.
 
+Start with a time to send it later (Telegram holds it and sends it by itself, even if this bot is offline):
+     17:00 Malika: see you tonight        5pm ask Malika if she's free
+     tomorrow 9:00 Aziz: happy birthday!  (or in AI mode: "at 5pm tell Malika I'm late")
+
 People are found in your saved contacts AND your recent chats. Spelling does not
 have to be exact: Малика / Malika / malikaga all find the same person.
 
@@ -17,6 +21,7 @@ Env vars (Render -> Environment):
   BOT_TOKEN          - from @BotFather
   GROQ_API_KEY       - from console.groq.com, free (optional, enables AI mode)
   GROQ_MODEL         - optional, default openai/gpt-oss-120b
+  TIMEZONE           - optional, your time zone for scheduled messages, default Asia/Tashkent
   STARTUP_DELAY      - optional, seconds to wait before logging in (default 25 on Render, 0 elsewhere)
   PORT               - set automatically by Render
 """
@@ -31,6 +36,8 @@ import sys
 import time
 import unicodedata
 import urllib.request
+from datetime import datetime, timedelta
+from zoneinfo import ZoneInfo
 
 import aiohttp
 from aiohttp import web
@@ -57,6 +64,11 @@ GROQ_MODEL = os.environ.get("GROQ_MODEL", "").strip() or "openai/gpt-oss-120b"
 PORT = int(os.environ.get("PORT", "10000"))
 # Render sets RENDER=true. See main() for why we wait there.
 STARTUP_DELAY = int(os.environ.get("STARTUP_DELAY", "").strip() or (25 if os.environ.get("RENDER") else 0))
+TIMEZONE = os.environ.get("TIMEZONE", "").strip() or "Asia/Tashkent"
+try:
+    TZ = ZoneInfo(TIMEZONE)
+except Exception:
+    sys.exit(f"Unknown TIMEZONE: {TIMEZONE}. Use a name like Asia/Tashkent or Europe/Moscow.")
 
 HELP = (
     "Two ways to send a message from your account:\n\n"
@@ -65,7 +77,13 @@ HELP = (
     "2) AI writes it — just describe what you want\n"
     "   ask Malika if she's free for dinner tomorrow at 7, make it sweet\n"
     "   спроси у Малики, свободна ли она завтра в 7 на ужин\n\n"
-    "You always see a preview first. Nothing is sent until you tap ✅ Send.\n\n"
+    "⏰ Send it later — start with the time:\n"
+    "   17:00 Malika: see you tonight\n"
+    "   5pm ask Malika if she's free\n"
+    "   tomorrow 9:00 Aziz: happy birthday!\n"
+    "   or just say it: at 5pm tell Malika I'm running late\n"
+    "Telegram sends it by itself at that time, even if this bot is offline.\n\n"
+    "You always see a preview first. Nothing is sent or scheduled until you tap the button.\n\n"
     "/who name — check who I find for a name"
 )
 
@@ -136,9 +154,67 @@ def rank(query, people):
     return [], [u for s, u in scored if s >= 0.42][:5]
 
 
-def preview(recipient, text, note=None):
-    body = f"To: {label(recipient)}\n\n{text}"
+def preview(recipient, text, note=None, at=None):
+    head = f"To: {label(recipient)}"
+    if at:
+        head += f"\n⏰ Sends {when_text(at)}"
+    body = f"{head}\n\n{text}"
     return f"{body}\n\n⚠️ {note}" if note else body
+
+
+# ---------- scheduling ----------
+
+TIME_PREFIX = re.compile(
+    r"(?:(?P<day>today|tomorrow|сегодня|завтра|bugun|ertaga)\s+)?(?P<at>at\s+|в\s+|soat\s+)?"
+    r"(?P<h>\d{1,2})(?:[:.](?P<m>\d{2}))?\s*(?P<ampm>[ap]\.?m\.?)?(?=[\s,])",
+    re.I,
+)
+TOMORROW = ("tomorrow", "завтра", "ertaga")
+
+
+def local_now():
+    return datetime.now(TZ)
+
+
+def split_time(raw, now):
+    """A time at the very start means 'send it then':
+    '17:00 Malika: hi' -> (today 17:00, 'Malika: hi'). No time -> (None, raw)."""
+    m = TIME_PREFIX.match(raw)
+    if not m or not (m["m"] or m["ampm"] or m["at"]):  # a bare '2 ...' is not a time
+        return None, raw
+    hour, minute = int(m["h"]), int(m["m"] or 0)
+    if m["ampm"]:
+        if not 1 <= hour <= 12:
+            return None, raw
+        hour = hour % 12 + (12 if m["ampm"][0].lower() == "p" else 0)
+    if hour > 23 or minute > 59:
+        return None, raw
+    at = now.replace(hour=hour, minute=minute, second=0, microsecond=0)
+    day = (m["day"] or "").lower()
+    if day in TOMORROW:
+        at += timedelta(days=1)
+    elif not day and at <= now:
+        at += timedelta(days=1)  # '9:00' when it is already 14:00 -> tomorrow 9:00
+    return at, raw[m.end():].lstrip(" ,")
+
+
+def parse_send_at(value):
+    """The AI's 'YYYY-MM-DD HH:MM' (your local time) -> datetime, or None."""
+    try:
+        return datetime.strptime(str(value).strip(), "%Y-%m-%d %H:%M").replace(tzinfo=TZ)
+    except ValueError:
+        return None
+
+
+def when_text(at):
+    today = local_now().date()
+    if at.date() == today:
+        day = "today"
+    elif at.date() == today + timedelta(days=1):
+        day = "tomorrow"
+    else:
+        day = f"{at:%a %d %b}"
+    return f"{day} at {at:%H:%M}"
 
 
 def send_error_text(exc):
@@ -184,7 +260,12 @@ async def ai_compose(owner_name, instruction, previous=None):
         "or Russian/Uzbek typed in Latin letters) unless the user asks for another language. "
         "Sound like a real person texting: natural, short, casual, no quotation marks, no signature, "
         "no explanations. Follow any tone the user asks for. "
-        'Reply with ONLY JSON: {"recipient": "...", "message": "..."}. '
+        f"Right now it is {local_now():%A %Y-%m-%d %H:%M} for the user. "
+        "If the user wants the message SENT later (e.g. 'send at 5pm', 'tomorrow at 9 write to Aziz', "
+        "'в 17:00 напиши Малике', 'soat 5 da Malikaga yoz'), put that moment in send_at as "
+        "'YYYY-MM-DD HH:MM' in the user's time. A time that is only part of what the message says "
+        "(e.g. 'ask if she is free at 7') is NOT send_at. If it should go now, send_at is null. "
+        'Reply with ONLY JSON: {"recipient": "...", "message": "...", "send_at": "YYYY-MM-DD HH:MM" or null}. '
         "If no recipient is clear, use null for recipient."
     )
     content = f"Instruction: {instruction}"
@@ -225,7 +306,7 @@ async def ai_compose(owner_name, instruction, previous=None):
     if not isinstance(result, dict):
         raise RuntimeError("AI returned an unexpected answer")
     recipient = result.get("recipient")
-    return recipient, drop_name((result.get("message") or "").strip(), recipient)
+    return recipient, drop_name((result.get("message") or "").strip(), recipient), result.get("send_at")
 
 
 def drop_name(message, recipient):
@@ -293,20 +374,23 @@ async def main():
     await bot.start(bot_token=BOT_TOKEN)
     log.info("Bot started")
 
-    # preview message id -> {"to": user, "text": str, "instruction": str|None, "busy": bool}
-    # "busy" is set while sending or writing another version, so a second tap can't send twice.
+    # preview message id -> {"to": user, "text": str, "instruction": str|None, "at": datetime|None, "busy": bool}
+    # "at" is when to send (None = now). "busy" is set while sending or writing another version,
+    # so a second tap can't send twice.
     pending = {}
-    choosing = {}  # "which one?" message id -> {"candidates": [...], "text": str, "instruction": str|None}
+    choosing = {}  # "which one?" message id -> {"candidates": [...], "text", "instruction", "at"}
+    scheduled = {}  # confirmation message id -> {"to": user, "id": scheduled msg id, "at": datetime, "text": str}
     people_cache = {"at": 0.0, "list": []}
 
-    def send_buttons(with_retry):
-        rows = [[Button.inline("✅ Send", b"send"), Button.inline("❌ Cancel", b"cancel")]]
+    def send_buttons(with_retry, at=None):
+        first = Button.inline("⏰ Schedule", b"send") if at else Button.inline("✅ Send", b"send")
+        rows = [[first, Button.inline("❌ Cancel", b"cancel")]]
         if with_retry:
             rows.append([Button.inline("🔄 Another version", b"retry")])
         return rows
 
-    def new_pending(recipient, text, instruction):
-        return {"to": recipient, "text": text, "instruction": instruction, "busy": False}
+    def new_pending(recipient, text, instruction, at=None):
+        return {"to": recipient, "text": text, "instruction": instruction, "at": at, "busy": False}
 
     async def edit_preview(event, text, buttons):
         try:
@@ -345,7 +429,7 @@ async def main():
                 return [], []
         return rank(query, await load_people())
 
-    async def propose(event, who, text, instruction, found=None):
+    async def propose(event, who, text, instruction, found=None, at=None):
         """Find the person and show a preview (or ask which person is meant)."""
         matches, suggestions = found if found is not None else await find_people(who)
         if not matches:
@@ -359,14 +443,14 @@ async def main():
             return
         if len(matches) == 1:
             shown = await event.reply(
-                preview(matches[0], text), buttons=send_buttons(bool(instruction)), parse_mode=None
+                preview(matches[0], text, at=at), buttons=send_buttons(bool(instruction), at), parse_mode=None
             )
-            pending[shown.id] = new_pending(matches[0], text, instruction)
+            pending[shown.id] = new_pending(matches[0], text, instruction, at)
             return
         rows = [[Button.inline(label(u)[:40], f"pick:{i}".encode())] for i, u in enumerate(matches)]
         rows.append([Button.inline("❌ Cancel", b"cancel")])
         ask = await event.reply(f"Which “{who}” do you mean?", buttons=rows, parse_mode=None)
-        choosing[ask.id] = {"candidates": matches, "text": text, "instruction": instruction}
+        choosing[ask.id] = {"candidates": matches, "text": text, "instruction": instruction, "at": at}
 
     @bot.on(events.NewMessage(pattern=r"^/(start|help)"))
     async def on_start(event):
@@ -400,6 +484,15 @@ async def main():
         if not raw:
             return
 
+        # "17:00 Malika: hi" / "5pm ask Malika ..." -> send at that time
+        at, raw = split_time(raw, local_now())
+        if at and at <= local_now():
+            await event.reply(f"{at:%H:%M} today has already passed. Use a later time.", parse_mode=None)
+            return
+        if not raw:
+            await event.reply("Need a message after the time.  Example:  17:00 Malika: hi", parse_mode=None)
+            return
+
         if looks_like_exact(raw):
             who, text = raw.split(":", 1)
             who, text = who.strip(), text.strip()
@@ -408,7 +501,7 @@ async def main():
                 return
             found = await find_people(who)
             if found[0] or not GROQ_API_KEY or who.startswith("@"):
-                await propose(event, who, text, None, found)
+                await propose(event, who, text, None, found, at)
                 return
             # "напиши Малике: привет" looks like "Name: text", but nobody is called
             # "напиши Малике" - so it is a request; let the AI read it below.
@@ -419,7 +512,7 @@ async def main():
             return
         thinking = await event.reply("✍️ Writing…")
         try:
-            who, text = await ai_compose(owner_name, raw)
+            who, text, send_at = await ai_compose(owner_name, raw)
         except Exception as exc:
             log.warning("AI compose failed: %s", exc)
             await thinking.edit(f"Couldn't write it: {exc}\nTry again, or use  Name: message", parse_mode=None)
@@ -430,8 +523,16 @@ async def main():
         if not text:
             await thinking.edit("Couldn't write the message, try rephrasing.")
             return
+        if at is None and send_at:  # "at 5pm tell Malika I'm late"
+            at = parse_send_at(send_at)
+            if at is None or at <= local_now():
+                await thinking.edit(
+                    "I couldn't work out a future time to send it. Start with the time, e.g.  17:00 Malika: hi",
+                    parse_mode=None,
+                )
+                return
         await thinking.delete()
-        await propose(event, str(who), text, raw)
+        await propose(event, str(who), text, raw, at=at)
 
     @bot.on(events.CallbackQuery)
     async def on_button(event):
@@ -441,6 +542,30 @@ async def main():
         data = event.data or b""
         mid = event.message_id
 
+        # 🗑 under a scheduled message
+        if data == b"unschedule":
+            item = scheduled.pop(mid, None)  # pop before any await, so a double tap does nothing twice
+            if not item:
+                await event.answer(
+                    "I lost track of it (the bot restarted). Open the chat → Scheduled messages to delete it.",
+                    alert=True,
+                )
+                return
+            if item["at"] <= local_now():
+                await event.edit(f"✅ Already sent to {label(item['to'])}\n\n{item['text']}", parse_mode=None)
+                return
+            try:
+                await user(functions.messages.DeleteScheduledMessagesRequest(peer=item["to"], id=[item["id"]]))
+            except Exception as exc:
+                scheduled[mid] = item
+                log.warning("Unschedule failed: %s", type(exc).__name__)
+                await event.answer(f"Couldn't cancel: {send_error_text(exc)}"[:190], alert=True)
+                return
+            await event.edit(f"🗑 Cancelled, nothing will be sent to {label(item['to'])}\n\n{item['text']}",
+                             parse_mode=None)
+            log.info("Scheduled message cancelled")
+            return
+
         # "which person?" step
         if mid in choosing:
             item = choosing.pop(mid)
@@ -448,9 +573,11 @@ async def main():
                 await event.edit("❌ Cancelled")
                 return
             recipient = item["candidates"][int(data[5:])]
-            pending[mid] = new_pending(recipient, item["text"], item["instruction"])
+            pending[mid] = new_pending(recipient, item["text"], item["instruction"], item["at"])
             await event.edit(
-                preview(recipient, item["text"]), buttons=send_buttons(bool(item["instruction"])), parse_mode=None
+                preview(recipient, item["text"], at=item["at"]),
+                buttons=send_buttons(bool(item["instruction"]), item["at"]),
+                parse_mode=None,
             )
             return
 
@@ -469,7 +596,7 @@ async def main():
             note = None
             try:
                 await event.answer("Writing another version…")
-                _, new_text = await ai_compose(owner_name, item["instruction"], previous=item["text"])
+                _, new_text, _ = await ai_compose(owner_name, item["instruction"], previous=item["text"])
                 if new_text:
                     item["text"] = new_text
                 else:
@@ -479,26 +606,45 @@ async def main():
                 note = f"Couldn't write another version: {exc}"
             finally:
                 item["busy"] = False
-            await edit_preview(event, preview(recipient, item["text"], note), send_buttons(True))
+            await edit_preview(event, preview(recipient, item["text"], note, item["at"]), send_buttons(True, item["at"]))
             return
 
         if data == b"send":
             item["busy"] = True  # before any await, so a double tap can't send twice
+            at, sent, note = item["at"], None, None
             try:
-                await event.answer("Sending…")
-                await user.send_message(recipient, item["text"], parse_mode=None)
+                if at and at <= local_now() + timedelta(seconds=30):
+                    # the preview waited too long; don't silently send it now
+                    item["at"] = None
+                    note = f"{at:%H:%M} has already passed. Tap ✅ Send to send it now."
+                else:
+                    await event.answer("Scheduling…" if at else "Sending…")
+                    sent = await user.send_message(recipient, item["text"], parse_mode=None, schedule=at)
             except Exception as exc:
                 log.warning("Send failed: %s", type(exc).__name__)
-                note = f"Not sent: {send_error_text(exc)}"
-            else:
-                pending.pop(mid, None)
+                note = f"Not {'scheduled' if at else 'sent'}: {send_error_text(exc)}"
+            finally:
+                item["busy"] = False
+            if note:
+                # keep the preview and its buttons, so you can tap again later
+                await edit_preview(event, preview(recipient, item["text"], note, item["at"]),
+                                   send_buttons(with_retry, item["at"]))
+                return
+            pending.pop(mid, None)
+            if not at:
                 await event.edit(f"✅ Sent to {label(recipient)}\n\n{item['text']}", parse_mode=None)
                 log.info("Message sent to a contact")
                 return
-            finally:
-                item["busy"] = False
-            # keep the preview and its buttons, so you can tap Send again later
-            await edit_preview(event, preview(recipient, item["text"], note), send_buttons(with_retry))
+            done = (f"⏰ Scheduled for {when_text(at)} → {label(recipient)}\n\n{item['text']}\n\n"
+                    "Telegram will send it from your account at that time, even if this bot is offline. "
+                    "You can also find it in that chat under Scheduled messages.")
+            sent_id = getattr(sent, "id", None)
+            buttons = None
+            if sent_id:
+                scheduled[mid] = {"to": recipient, "id": sent_id, "at": at, "text": item["text"]}
+                buttons = [[Button.inline("🗑 Cancel scheduled message", b"unschedule")]]
+            await event.edit(done, buttons=buttons, parse_mode=None)
+            log.info("Message scheduled")
             return
 
         pending.pop(mid, None)
