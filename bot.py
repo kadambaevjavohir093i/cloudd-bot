@@ -277,48 +277,85 @@ async def ai_compose(owner_name, instruction, previous=None):
         "'в 17:00 напиши Малике', 'soat 5 da Malikaga yoz'), put that moment in send_at as "
         "'YYYY-MM-DD HH:MM' in the user's time. A time that is only part of what the message says "
         "(e.g. 'ask if she is free at 7') is NOT send_at. If it should go now, send_at is null. "
-        'Reply with ONLY JSON: {"recipient": "...", "message": "...", "send_at": "YYYY-MM-DD HH:MM" or null}. '
-        "If no recipient is clear, use null for recipient."
+        "Reply with ONLY a JSON object with exactly these keys: "
+        '{"recipient": "...", "message": "...", "send_at": null} '
+        '- send_at is null or a string like "2026-11-28 17:00"; recipient is null if no recipient is clear.'
     )
     content = f"Instruction: {instruction}"
     if previous:
         content += f"\n\nYou already suggested this; write a noticeably different version:\n{previous}"
+    messages = [{"role": "system", "content": system}, {"role": "user", "content": content}]
 
+    problem = "AI returned an unexpected answer"
     async with aiohttp.ClientSession() as http:
-        async with http.post(
-            "https://api.groq.com/openai/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {GROQ_API_KEY}",
-                "content-type": "application/json",
-            },
-            json={
-                "model": GROQ_MODEL,
-                "max_completion_tokens": 1500,
-                "messages": [
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": content},
-                ],
-            },
-            timeout=aiohttp.ClientTimeout(total=60),
-        ) as resp:
+        for _attempt in range(2):  # the model sometimes fumbles the format; a second try usually works
             try:
-                data = await resp.json(content_type=None)
-            except ValueError:  # e.g. an HTML error page
-                raise RuntimeError(f"AI error: HTTP {resp.status}") from None
-            if resp.status != 200:
-                err = (data.get("error") or {}).get("message") if isinstance(data, dict) else None
-                raise RuntimeError(f"AI error: {err or resp.status}")
+                text, finish = await ai_request(http, messages)
+            except AIFormatError:
+                log.warning("AI answer failed Groq's JSON check, trying again")
+                continue
+            result = parse_ai_json(text)
+            if result:
+                recipient = result.get("recipient")
+                message = drop_name(str(result.get("message") or "").strip(), recipient)
+                return recipient, message, result.get("send_at")
+            log.warning("AI answer not usable (finish_reason=%s): %.150r", finish, text)
+            if finish == "length":
+                problem = "AI answer was cut off"
+    raise RuntimeError(problem)
 
-    text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
-    match = re.search(r"\{.*\}", text, re.S)
-    try:
-        result = json.loads(match.group(0)) if match else None
-    except ValueError:
-        result = None
-    if not isinstance(result, dict):
-        raise RuntimeError("AI returned an unexpected answer")
-    recipient = result.get("recipient")
-    return recipient, drop_name((result.get("message") or "").strip(), recipient), result.get("send_at")
+
+class AIFormatError(Exception):
+    """Groq's JSON mode rejected what the model wrote."""
+
+
+AI_OPTIONS = {"json_mode": True}  # switched off for good if the model doesn't support JSON mode
+
+
+async def ai_request(http, messages):
+    """One call to Groq. Returns (answer text, finish_reason)."""
+    body = {"model": GROQ_MODEL, "max_completion_tokens": 4000, "messages": messages}
+    if AI_OPTIONS["json_mode"]:
+        body["response_format"] = {"type": "json_object"}  # Groq makes sure the answer is valid JSON
+    if GROQ_MODEL.startswith("openai/gpt-oss"):
+        # Its thinking counts against max_completion_tokens; long thinking left no room for the answer.
+        body["reasoning_effort"] = "low"
+    async with http.post(
+        "https://api.groq.com/openai/v1/chat/completions",
+        headers={"Authorization": f"Bearer {GROQ_API_KEY}", "content-type": "application/json"},
+        json=body,
+        timeout=aiohttp.ClientTimeout(total=60),
+    ) as resp:
+        try:
+            data = await resp.json(content_type=None)
+        except ValueError:  # e.g. an HTML error page
+            raise RuntimeError(f"AI error: HTTP {resp.status}") from None
+        if resp.status != 200:
+            err = (data.get("error") or {}) if isinstance(data, dict) else {}
+            message = str(err.get("message") or resp.status)
+            if err.get("code") == "json_validate_failed":
+                raise AIFormatError(message)
+            if AI_OPTIONS["json_mode"] and "response_format" in message:
+                log.warning("Model has no JSON mode, continuing without it")
+                AI_OPTIONS["json_mode"] = False
+                return await ai_request(http, messages)
+            raise RuntimeError(f"AI error: {message}")
+    choice = (data.get("choices") or [{}])[0]
+    return (choice.get("message") or {}).get("content") or "", choice.get("finish_reason")
+
+
+def parse_ai_json(text):
+    """The first JSON object in the answer that has a "message", or None.
+    Copes with code fences, text around the JSON, and several objects in one answer."""
+    decoder = json.JSONDecoder()
+    for start in (i for i, ch in enumerate(text) if ch == "{"):
+        try:
+            obj, _ = decoder.raw_decode(text, start)
+        except ValueError:
+            continue
+        if isinstance(obj, dict) and obj.get("message"):
+            return obj
+    return None
 
 
 def drop_name(message, recipient):
