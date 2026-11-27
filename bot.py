@@ -177,7 +177,9 @@ async def ai_compose(owner_name, instruction, previous=None):
         f"You write Telegram messages that {owner_name} will send from their own account to their contacts. "
         "From the instruction, find the recipient exactly as the user named them (a name or @username, "
         "in its base form, e.g. 'Малики' -> 'Малика', 'Malikaga' -> 'Malika'), and write the message "
-        f"in first person as {owner_name}, addressed to that person. "
+        f"in first person as {owner_name}, to send to that person. "
+        "Do NOT put the recipient's name or @username in the message (no 'Hi Malika', no 'Yo Malika', "
+        "no 'Привет, Малика') - the chat already shows who it is for; just write the message itself. "
         "Write in the same language and script the instruction is written in (Russian, Uzbek, English, "
         "or Russian/Uzbek typed in Latin letters) unless the user asks for another language. "
         "Sound like a real person texting: natural, short, casual, no quotation marks, no signature, "
@@ -222,7 +224,25 @@ async def ai_compose(owner_name, instruction, previous=None):
         result = None
     if not isinstance(result, dict):
         raise RuntimeError("AI returned an unexpected answer")
-    return result.get("recipient"), (result.get("message") or "").strip()
+    recipient = result.get("recipient")
+    return recipient, drop_name((result.get("message") or "").strip(), recipient)
+
+
+def drop_name(message, recipient):
+    """Safety net in case the AI still greets by name: 'Yo Malika, what's up?' -> 'Yo, what's up?'.
+    Only the name near the start (the greeting) is removed, so normal words later stay intact."""
+    name = str(recipient or "").lstrip("@").strip()
+    if not name or not message:
+        return message
+    m = re.search(rf"[ \t]*,?[ \t]*(?<!\w)@?{re.escape(name)}(?!\w)", message, re.I)
+    if not m or len(message[:m.start()].split()) > 3:
+        return message
+    head, tail = message[:m.start()], message[m.end():]
+    if not head.strip():  # the message started with the name: 'Malika, how are you?'
+        tail = tail.lstrip(" \t,!.:;-—–")
+        tail = tail[:1].upper() + tail[1:]
+    cleaned = (head + tail).strip()
+    return cleaned or message
 
 
 # ---------- bot ----------
