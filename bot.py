@@ -69,6 +69,7 @@ try:
     TZ = ZoneInfo(TIMEZONE)
 except Exception:
     sys.exit(f"Unknown TIMEZONE: {TIMEZONE}. Use a name like Asia/Tashkent or Europe/Moscow.")
+ZONE_NAME = TIMEZONE.split("/")[-1].replace("_", " ")  # "Tashkent"
 
 HELP = (
     "Two ways to send a message from your account:\n\n"
@@ -82,6 +83,7 @@ HELP = (
     "   5pm ask Malika if she's free\n"
     "   tomorrow 9:00 Aziz: happy birthday!\n"
     "   or just say it: at 5pm tell Malika I'm running late\n"
+    f"Times are {ZONE_NAME} time, whatever your phone's clock says.\n"
     "Telegram sends it by itself at that time, even if this bot is offline.\n\n"
     "You always see a preview first. Nothing is sent or scheduled until you tap the button.\n\n"
     "/who name — check who I find for a name"
@@ -214,7 +216,17 @@ def when_text(at):
         day = "tomorrow"
     else:
         day = f"{at:%a %d %b}"
-    return f"{day} at {at:%H:%M}"
+    return f"{day} at {at:%H:%M} {ZONE_NAME} time ({until_text(at)})"
+
+
+def until_text(at):
+    """'in 1h 49min' - lets you check the time no matter what your phone's clock is set to."""
+    mins = max(0, round((at - local_now()).total_seconds() / 60))
+    hours, mins = divmod(mins, 60)
+    if hours >= 24:
+        days, hours = divmod(hours, 24)
+        return f"in {days}d {hours}h"
+    return f"in {hours}h {mins}min" if hours else f"in {mins} min"
 
 
 def send_error_text(exc):
